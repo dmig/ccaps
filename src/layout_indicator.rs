@@ -81,6 +81,9 @@ unsafe fn is_english_layout_hkl(layout: HKL) -> bool {
 }
 
 // Toggle a single key's LED if its current toggle state differs from `enabled`.
+// Uses CCAPS_EXTRA_INFO so the keyboard hook recognises these as CCaps's own events
+// (critical for VK_CAPITAL: without the marker the hook would block the toggle and
+// trigger an unwanted layout switch).
 unsafe fn set_key_toggle(vk: i32, enabled: bool) {
     unsafe {
         let current_state = GetKeyState(vk) & 1;
@@ -92,10 +95,12 @@ unsafe fn set_key_toggle(vk: i32, enabled: bool) {
             inputs[0].type_ = INPUT_KEYBOARD;
             inputs[0].u.ki_mut().wVk = vk as u16;
             inputs[0].u.ki_mut().dwFlags = 0;
+            inputs[0].u.ki_mut().dwExtraInfo = CCAPS_EXTRA_INFO;
 
             inputs[1].type_ = INPUT_KEYBOARD;
             inputs[1].u.ki_mut().wVk = vk as u16;
             inputs[1].u.ki_mut().dwFlags = KEYEVENTF_KEYUP;
+            inputs[1].u.ki_mut().dwExtraInfo = CCAPS_EXTRA_INFO;
 
             SendInput(2, inputs.as_mut_ptr(), mem::size_of::<INPUT>() as i32);
         }
