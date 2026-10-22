@@ -250,6 +250,7 @@ fn cleanup_and_exit() {
     unsafe {
         uninstall_hook();
         layout_switcher::stop();
+        layout_indicator::close_kbd_device();
         let mutex = MUTEX_HANDLE.swap(ptr::null_mut(), Ordering::SeqCst);
         if !mutex.is_null() {
             CloseHandle(mutex);

@@ -2,7 +2,9 @@ use crate::console_log;
 use crate::keyboard_hook::CCAPS_EXTRA_INFO;
 use crate::layout_manager;
 use crate::layout_switcher;
+use std::ffi::OsStr;
 use std::mem;
+use std::os::windows::ffi::OsStrExt;
 use std::ptr;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Mutex;
@@ -10,6 +12,10 @@ use std::time::{Duration, Instant};
 use winapi::shared::basetsd::UINT_PTR;
 use winapi::shared::minwindef::{DWORD, HKL, UINT};
 use winapi::shared::windef::HWND;
+use winapi::um::fileapi::{CreateFileW, DefineDosDeviceW, OPEN_EXISTING};
+use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
+use winapi::um::ioapiset::DeviceIoControl;
+use winapi::um::winnt::GENERIC_WRITE;
 use winapi::um::winuser::*;
 
 // Bitfield for which LEDs to use as layout indicator
@@ -80,45 +86,187 @@ unsafe fn is_english_layout_hkl(layout: HKL) -> bool {
     )
 }
 
-// Toggle a single key's LED if its current toggle state differs from `enabled`.
-// Uses CCAPS_EXTRA_INFO so the keyboard hook recognises these as CCaps's own events
-// (critical for VK_CAPITAL: without the marker the hook would block the toggle and
-// trigger an unwanted layout switch).
-unsafe fn set_key_toggle(vk: i32, enabled: bool) {
+// IOCTL constants for direct keyboard LED control via the keyboard class driver.
+// This bypasses the input system entirely: the LED changes without affecting the
+// toggle state (CapsLock typing, Num Lock number pad, Scroll Lock behaviour).
+const IOCTL_KEYBOARD_SET_INDICATORS: u32 = 0x000B_0008;
+const IOCTL_KEYBOARD_QUERY_INDICATORS: u32 = 0x000B_0040;
+
+const KEYBOARD_SCROLL_LOCK_ON: u16 = 1;
+const KEYBOARD_NUM_LOCK_ON: u16 = 2;
+const KEYBOARD_CAPS_LOCK_ON: u16 = 4;
+
+// DefineDosDevice flags (not in winapi's fileapi feature constants)
+const DDD_RAW_TARGET_PATH: u32 = 0x0000_0001;
+const DDD_REMOVE_DEFINITION: u32 = 0x0000_0002;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct KeyboardIndicatorParameters {
+    unit_id: u16,
+    led_flags: u16,
+}
+
+fn to_wide(s: &str) -> Vec<u16> {
+    OsStr::new(s)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
+}
+
+// Wrapper for a raw HANDLE so it can live in a static Mutex.
+// Safety: Windows HANDLEs are documented as safe to use from any thread.
+struct SendHandle(*mut winapi::ctypes::c_void);
+unsafe impl Send for SendHandle {}
+
+// Handle to the keyboard class driver, opened once and reused.
+// Lazily initialised on the first call to set_indicator_leds().
+static KBD_HANDLE: Mutex<Option<SendHandle>> = Mutex::new(None);
+
+/// Open `\\Device\\KeyboardClass0` via a DOS device symlink and cache the handle.
+/// Returns the handle, or null on failure.
+unsafe fn open_kbd_device() -> *mut winapi::ctypes::c_void {
+    let device_name = to_wide("CcapsKbd");
+    let target_path = to_wide("\\Device\\KeyboardClass0");
+    let file_path = to_wide("\\\\.\\CcapsKbd");
+
     unsafe {
-        let current_state = GetKeyState(vk) & 1;
-        let is_currently_on = current_state != 0;
+        if DefineDosDeviceW(DDD_RAW_TARGET_PATH, device_name.as_ptr(), target_path.as_ptr()) == 0 {
+            return ptr::null_mut();
+        }
 
-        if is_currently_on != enabled {
-            let mut inputs: [INPUT; 2] = mem::zeroed();
+        let handle = CreateFileW(
+            file_path.as_ptr(),
+            GENERIC_WRITE,
+            0,
+            ptr::null_mut(),
+            OPEN_EXISTING,
+            0,
+            ptr::null_mut(),
+        );
 
-            inputs[0].type_ = INPUT_KEYBOARD;
-            inputs[0].u.ki_mut().wVk = vk as u16;
-            inputs[0].u.ki_mut().dwFlags = 0;
-            inputs[0].u.ki_mut().dwExtraInfo = CCAPS_EXTRA_INFO;
+        if handle == INVALID_HANDLE_VALUE {
+            DefineDosDeviceW(DDD_REMOVE_DEFINITION, device_name.as_ptr(), ptr::null());
+            return ptr::null_mut();
+        }
 
-            inputs[1].type_ = INPUT_KEYBOARD;
-            inputs[1].u.ki_mut().wVk = vk as u16;
-            inputs[1].u.ki_mut().dwFlags = KEYEVENTF_KEYUP;
-            inputs[1].u.ki_mut().dwExtraInfo = CCAPS_EXTRA_INFO;
+        handle
+    }
+}
 
-            SendInput(2, inputs.as_mut_ptr(), mem::size_of::<INPUT>() as i32);
+/// Get the cached keyboard device handle, opening it on first use.
+unsafe fn get_kbd_handle() -> *mut winapi::ctypes::c_void {
+    let mut guard = KBD_HANDLE.lock().unwrap_or_else(|e| e.into_inner());
+    match guard.as_ref() {
+        Some(h) => h.0,
+        None => unsafe {
+            let h = open_kbd_device();
+            if !h.is_null() {
+                *guard = Some(SendHandle(h));
+            }
+            h
+        },
+    }
+}
+
+/// Query current LED flags from the keyboard hardware.
+unsafe fn query_hw_leds() -> Option<u16> {
+    unsafe {
+        let h = get_kbd_handle();
+        if h.is_null() {
+            return None;
+        }
+        let mut output = KeyboardIndicatorParameters::default();
+        let mut returned: u32 = 0;
+        let ok = DeviceIoControl(
+            h,
+            IOCTL_KEYBOARD_QUERY_INDICATORS,
+            ptr::null_mut(),
+            0,
+            &mut output as *mut _ as *mut _,
+            mem::size_of::<KeyboardIndicatorParameters>() as u32,
+            &mut returned,
+            ptr::null_mut(),
+        );
+        if ok == 0 {
+            None
+        } else {
+            Some(output.led_flags)
         }
     }
 }
 
-// Set all active indicator LEDs to `enabled`
+/// Set LED flags on the keyboard hardware (does NOT change toggle state).
+unsafe fn set_hw_leds(led_flags: u16) -> bool {
+    unsafe {
+        let h = get_kbd_handle();
+        if h.is_null() {
+            return false;
+        }
+        let mut input = KeyboardIndicatorParameters {
+            unit_id: 0,
+            led_flags,
+        };
+        let mut returned: u32 = 0;
+        DeviceIoControl(
+            h,
+            IOCTL_KEYBOARD_SET_INDICATORS,
+            &mut input as *mut _ as *mut _,
+            mem::size_of::<KeyboardIndicatorParameters>() as u32,
+            ptr::null_mut(),
+            0,
+            &mut returned,
+            ptr::null_mut(),
+        ) != 0
+    }
+}
+
+/// Clean up the keyboard device handle and DOS device symlink.
+/// Called during shutdown to release resources.
+pub fn close_kbd_device() {
+    let mut guard = KBD_HANDLE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(SendHandle(h)) = guard.take() {
+        unsafe {
+            CloseHandle(h);
+            let device_name = to_wide("CcapsKbd");
+            DefineDosDeviceW(DDD_REMOVE_DEFINITION, device_name.as_ptr(), ptr::null());
+        }
+    }
+}
+
+/// Map our LED_* bitfield to the KEYBOARD_*_ON flags used by the IOCTL.
+fn ccaps_mask_to_hw(ccaps_mask: u8) -> u16 {
+    let mut hw: u16 = 0;
+    if ccaps_mask & LED_SCROLL != 0 {
+        hw |= KEYBOARD_SCROLL_LOCK_ON;
+    }
+    if ccaps_mask & LED_NUM != 0 {
+        hw |= KEYBOARD_NUM_LOCK_ON;
+    }
+    if ccaps_mask & LED_CAPS != 0 {
+        hw |= KEYBOARD_CAPS_LOCK_ON;
+    }
+    hw
+}
+
+// Set all active indicator LEDs to `enabled` via IOCTL (no toggle-state side effects)
 unsafe fn set_indicator_leds(enabled: bool) {
     unsafe {
         let mask = ACTIVE_LEDS.load(Ordering::SeqCst);
-        if mask & LED_SCROLL != 0 {
-            set_key_toggle(VK_SCROLL, enabled);
+        if mask == 0 {
+            return;
         }
-        if mask & LED_NUM != 0 {
-            set_key_toggle(VK_NUMLOCK, enabled);
-        }
-        if mask & LED_CAPS != 0 {
-            set_key_toggle(VK_CAPITAL, enabled);
+
+        let hw_mask = ccaps_mask_to_hw(mask);
+        if let Some(current) = query_hw_leds() {
+            let new_flags = if enabled {
+                current | hw_mask
+            } else {
+                current & !hw_mask
+            };
+            if new_flags != current {
+                set_hw_leds(new_flags);
+            }
         }
     }
 }
@@ -497,5 +645,29 @@ mod tests {
                 "Zero HKL should not be detected as English"
             );
         }
+    }
+
+    #[test]
+    fn test_ccaps_mask_to_hw_single() {
+        assert_eq!(ccaps_mask_to_hw(LED_SCROLL), KEYBOARD_SCROLL_LOCK_ON);
+        assert_eq!(ccaps_mask_to_hw(LED_NUM), KEYBOARD_NUM_LOCK_ON);
+        assert_eq!(ccaps_mask_to_hw(LED_CAPS), KEYBOARD_CAPS_LOCK_ON);
+    }
+
+    #[test]
+    fn test_ccaps_mask_to_hw_multiple() {
+        assert_eq!(
+            ccaps_mask_to_hw(LED_SCROLL | LED_CAPS),
+            KEYBOARD_SCROLL_LOCK_ON | KEYBOARD_CAPS_LOCK_ON
+        );
+        assert_eq!(
+            ccaps_mask_to_hw(LED_SCROLL | LED_NUM | LED_CAPS),
+            KEYBOARD_SCROLL_LOCK_ON | KEYBOARD_NUM_LOCK_ON | KEYBOARD_CAPS_LOCK_ON
+        );
+    }
+
+    #[test]
+    fn test_ccaps_mask_to_hw_zero() {
+        assert_eq!(ccaps_mask_to_hw(0), 0);
     }
 }
