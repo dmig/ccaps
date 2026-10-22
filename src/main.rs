@@ -28,7 +28,13 @@ static MUTEX_HANDLE: AtomicPtr<winapi::ctypes::c_void> = AtomicPtr::new(ptr::nul
 
 fn main() {
     // Parse command line arguments
-    let ParsedArgs { command, led_mask } = parse_args();
+    let ParsedArgs { command, led_mask } = match parse_args() {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
 
     // Apply LED mask if specified (0 = not given, keep default)
     if led_mask != 0 {

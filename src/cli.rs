@@ -53,26 +53,27 @@ pub fn quit_removed_hint(prefix: &str) -> String {
 }
 
 /// Parsed command line: the command to run plus the LED indicator mask.
+#[derive(Debug)]
 pub struct ParsedArgs {
     pub command: CliCommand,
     /// Bitfield of `layout_indicator::LED_*` flags, 0 when `-led` was not given
     pub led_mask: u8,
 }
 
-pub fn parse_args() -> ParsedArgs {
+pub fn parse_args() -> Result<ParsedArgs, String> {
     let args: Vec<String> = env::args().skip(1).collect();
     parse_command(&args)
 }
 
 // Parses the command line without the program name. No arguments: interactive menu.
-fn parse_command(args: &[String]) -> ParsedArgs {
-    let (led_mask, remaining) = extract_led_option(args);
+fn parse_command(args: &[String]) -> Result<ParsedArgs, String> {
+    let (led_mask, remaining) = extract_led_option(args)?;
 
     let Some(command) = remaining.first() else {
-        return ParsedArgs {
+        return Ok(ParsedArgs {
             command: CliCommand::Menu,
             led_mask,
-        };
+        });
     };
     let country_codes = || parse_country_codes(&remaining[1..]);
 
@@ -89,53 +90,53 @@ fn parse_command(args: &[String]) -> ParsedArgs {
         "-v" | "--version" => CliCommand::Version,
         _ => CliCommand::Unknown(command.clone()),
     };
-    ParsedArgs { command, led_mask }
+    Ok(ParsedArgs { command, led_mask })
 }
 
 // Extract the `-led <value>` option from the argument list. Returns the LED mask
 // (0 = not specified, use default) and the remaining arguments. The `-led` option
 // can appear anywhere; its value is a comma-separated list of: scroll, num, caps.
-fn extract_led_option(args: &[String]) -> (u8, Vec<String>) {
+fn extract_led_option(args: &[String]) -> Result<(u8, Vec<String>), String> {
     let mut mask: u8 = 0;
     let mut remaining = Vec::new();
     let mut i = 0;
     while i < args.len() {
         if args[i] == "-led" {
             if let Some(value) = args.get(i + 1) {
-                mask = parse_led_value(value);
-                if mask == 0 {
-                    eprintln!(
-                        "Warning: invalid -led value '{}', expected comma-separated list of: scroll, num, caps",
-                        value
-                    );
-                }
+                mask = parse_led_value(value)?;
                 i += 2;
                 continue;
             } else {
-                eprintln!("Warning: -led requires a value (scroll, num, caps)");
-                i += 1;
-                continue;
+                return Err("-led requires a value (scroll, num, caps)".to_string());
             }
         }
         remaining.push(args[i].clone());
         i += 1;
     }
-    (mask, remaining)
+    Ok((mask, remaining))
 }
 
 /// Parse a comma-separated LED specifier like "scroll,num" into a bitfield.
-/// Returns 0 on empty or invalid input.
-fn parse_led_value(value: &str) -> u8 {
+fn parse_led_value(value: &str) -> Result<u8, String> {
     let mut mask: u8 = 0;
     for part in value.split(',') {
-        match part.trim().to_lowercase().as_str() {
+        let token = part.trim().to_lowercase();
+        match token.as_str() {
             "scroll" => mask |= layout_indicator::LED_SCROLL,
             "num" => mask |= layout_indicator::LED_NUM,
             "caps" => mask |= layout_indicator::LED_CAPS,
-            _ => return 0, // any unknown token invalidates the whole value
+            _ => {
+                return Err(format!(
+                    "invalid -led value '{}', expected comma-separated list of: scroll, num, caps",
+                    value
+                ))
+            }
         }
     }
-    mask
+    if mask == 0 {
+        return Err("-led requires a value (scroll, num, caps)".to_string());
+    }
+    Ok(mask)
 }
 
 // Country codes from arguments like "-de -fr" (the leading dash is removed). Arguments
@@ -937,13 +938,18 @@ mod tests {
 
     fn parse(args: &[&str]) -> CliCommand {
         let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-        parse_command(&args).command
+        parse_command(&args).unwrap().command
     }
 
     fn parse_with_led(args: &[&str]) -> (CliCommand, u8) {
         let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-        let parsed = parse_command(&args);
+        let parsed = parse_command(&args).unwrap();
         (parsed.command, parsed.led_mask)
+    }
+
+    fn parse_err(args: &[&str]) -> String {
+        let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        parse_command(&args).unwrap_err()
     }
 
     fn codes(codes: &[&str]) -> Vec<String> {
@@ -1123,7 +1129,7 @@ mod tests {
             .map(String::from)
             .collect();
         assert_eq!(
-            parse_command(&args).command,
+            parse_command(&args).unwrap().command,
             CliCommand::Background(codes(&["ru"]))
         );
     }
@@ -1171,8 +1177,14 @@ mod tests {
 
     #[test]
     fn test_led_option_invalid_value() {
-        let (_, mask) = parse_with_led(&["-run", "-led", "invalid"]);
-        assert_eq!(mask, 0);
+        let err = parse_err(&["-run", "-led", "invalid"]);
+        assert!(err.contains("invalid -led value"), "unexpected error: {}", err);
+    }
+
+    #[test]
+    fn test_led_option_missing_value() {
+        let err = parse_err(&["-run", "-led"]);
+        assert!(err.contains("-led requires a value"), "unexpected error: {}", err);
     }
 
     #[test]
