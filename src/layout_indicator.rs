@@ -12,6 +12,36 @@ use winapi::shared::minwindef::{DWORD, HKL, UINT};
 use winapi::shared::windef::HWND;
 use winapi::um::winuser::*;
 
+// Bitfield for which LEDs to use as layout indicator
+pub const LED_SCROLL: u8 = 0b001;
+pub const LED_NUM: u8 = 0b010;
+pub const LED_CAPS: u8 = 0b100;
+
+// Which LEDs are active (default: Scroll Lock only, matching original behavior)
+pub static ACTIVE_LEDS: AtomicU8 = AtomicU8::new(LED_SCROLL);
+
+/// Configure which LEDs to use as layout indicator. Pass a bitfield of
+/// `LED_SCROLL`, `LED_NUM`, `LED_CAPS`. Must be called before `run_main_loop`.
+pub fn set_active_leds(mask: u8) {
+    ACTIVE_LEDS.store(mask, Ordering::SeqCst);
+}
+
+/// Return a human-readable name for the active LEDs (for log messages).
+fn active_led_names() -> String {
+    let mask = ACTIVE_LEDS.load(Ordering::SeqCst);
+    let mut names = Vec::new();
+    if mask & LED_SCROLL != 0 {
+        names.push("Scroll Lock");
+    }
+    if mask & LED_NUM != 0 {
+        names.push("Num Lock");
+    }
+    if mask & LED_CAPS != 0 {
+        names.push("Caps Lock");
+    }
+    names.join(" + ")
+}
+
 // Function to check if given layout is English
 unsafe fn is_english_layout_hkl(layout: HKL) -> bool {
     // Extract language ID from layout handle
@@ -50,30 +80,40 @@ unsafe fn is_english_layout_hkl(layout: HKL) -> bool {
     )
 }
 
-// Function to set Scroll Lock state
-unsafe fn set_scroll_lock_state(enabled: bool) {
+// Toggle a single key's LED if its current toggle state differs from `enabled`.
+unsafe fn set_key_toggle(vk: i32, enabled: bool) {
     unsafe {
-        // Get current Scroll Lock state
-        let current_state = GetKeyState(VK_SCROLL) & 1;
+        let current_state = GetKeyState(vk) & 1;
         let is_currently_on = current_state != 0;
 
-        // Only change if state is different
         if is_currently_on != enabled {
-            // Create input for toggling Scroll Lock
             let mut inputs: [INPUT; 2] = mem::zeroed();
 
-            // First INPUT - Scroll Lock press
             inputs[0].type_ = INPUT_KEYBOARD;
-            inputs[0].u.ki_mut().wVk = VK_SCROLL as u16;
+            inputs[0].u.ki_mut().wVk = vk as u16;
             inputs[0].u.ki_mut().dwFlags = 0;
 
-            // Second INPUT - Scroll Lock release
             inputs[1].type_ = INPUT_KEYBOARD;
-            inputs[1].u.ki_mut().wVk = VK_SCROLL as u16;
+            inputs[1].u.ki_mut().wVk = vk as u16;
             inputs[1].u.ki_mut().dwFlags = KEYEVENTF_KEYUP;
 
-            // Send press and release events
             SendInput(2, inputs.as_mut_ptr(), mem::size_of::<INPUT>() as i32);
+        }
+    }
+}
+
+// Set all active indicator LEDs to `enabled`
+unsafe fn set_indicator_leds(enabled: bool) {
+    unsafe {
+        let mask = ACTIVE_LEDS.load(Ordering::SeqCst);
+        if mask & LED_SCROLL != 0 {
+            set_key_toggle(VK_SCROLL, enabled);
+        }
+        if mask & LED_NUM != 0 {
+            set_key_toggle(VK_NUMLOCK, enabled);
+        }
+        if mask & LED_CAPS != 0 {
+            set_key_toggle(VK_CAPITAL, enabled);
         }
     }
 }
@@ -102,10 +142,10 @@ const SYNC_INTERVAL_MS: u32 = 250;
 // coalesce the wake-up with other timers instead of waking the CPU just for CCaps
 const SYNC_TOLERANCE_MS: u32 = 100;
 
-// Sets Scroll Lock to `enabled` and remembers it as the last applied state
+// Sets the active indicator LEDs to `enabled` and remembers the last applied state
 unsafe fn apply_indicator(enabled: bool) {
     unsafe {
-        set_scroll_lock_state(enabled);
+        set_indicator_leds(enabled);
         LAST_INDICATOR.store(
             if enabled { INDICATOR_ON } else { INDICATOR_OFF },
             Ordering::SeqCst,
@@ -189,9 +229,10 @@ unsafe extern "system" fn sync_timer_proc(_hwnd: HWND, _msg: UINT, _id: UINT_PTR
                 let layout = layout_manager::current_layout_hkl()
                     .map_or_else(|| "?".to_string(), layout_switcher::layout_code);
                 console_log::log(&format!(
-                    "Layout {} in {}, not switched by CCaps → Scroll Lock {}",
+                    "Layout {} in {}, not switched by CCaps → {} {}",
                     layout,
                     layout_manager::foreground_app(),
+                    active_led_names(),
                     if enabled { "ON" } else { "OFF" }
                 ));
             }
@@ -223,7 +264,16 @@ pub unsafe fn start_indicator_sync() {
 // Only sends key events if CapsLock is actually on, avoiding
 // unnecessary toggles that can cause LED desynchronization during
 // Windows startup due to unreliable SendInput timing.
+//
+// Skipped when CapsLock LED is used as a layout indicator: the indicator
+// will set the LED to the correct state based on the current layout.
 pub unsafe fn ensure_caps_lock_off() {
+    // When CapsLock LED is an indicator, don't force it off here:
+    // apply_indicator() will set it based on the current layout
+    if ACTIVE_LEDS.load(Ordering::SeqCst) & LED_CAPS != 0 {
+        return;
+    }
+
     unsafe {
         // Synchronize the thread's key state table before querying.
         // GetKeyState() relies on the thread's internal key state buffer,
