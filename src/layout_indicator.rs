@@ -17,8 +17,8 @@ pub const LED_SCROLL: u8 = 0b001;
 pub const LED_NUM: u8 = 0b010;
 pub const LED_CAPS: u8 = 0b100;
 
-// Which LEDs are active (default: Scroll Lock only, matching original behavior)
-pub static ACTIVE_LEDS: AtomicU8 = AtomicU8::new(LED_SCROLL);
+// Which LEDs are active (default: none — no indicator unless -led is specified)
+pub static ACTIVE_LEDS: AtomicU8 = AtomicU8::new(0);
 
 /// Configure which LEDs to use as layout indicator. Pass a bitfield of
 /// `LED_SCROLL`, `LED_NUM`, `LED_CAPS`. Must be called before `run_main_loop`.

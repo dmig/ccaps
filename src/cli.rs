@@ -523,7 +523,7 @@ fn show_help() {
     println!();
     println!("Options:");
     println!("  -led <leds>            - LED indicator: scroll, num, caps (comma-separated)");
-    println!("                           Default: scroll. Example: -led num,caps");
+    println!("                           No indicator by default. Example: -led scroll");
     println!();
     println!("Configuration:");
     println!("  Settings are saved by -enable and deleted by -disable");
@@ -742,7 +742,7 @@ fn remove_from_startup() -> Result<(), String> {
 fn background_command_line(exe_path: &Path, country_codes: &[String]) -> String {
     let mut command_line = format!("\"{}\" --background", exe_path.display());
     let led_mask = layout_indicator::ACTIVE_LEDS.load(std::sync::atomic::Ordering::SeqCst);
-    if led_mask != layout_indicator::LED_SCROLL {
+    if led_mask != 0 {
         command_line.push_str(&format!(" -led {}", led_mask_to_string(led_mask)));
     }
     for code in country_codes {
@@ -1204,19 +1204,19 @@ mod tests {
 
     #[test]
     fn test_led_option_preserved_in_background_command_line() {
-        // When non-default LEDs are active, background_command_line includes -led
+        // When LEDs are active, background_command_line includes -led
         layout_indicator::set_active_leds(layout_indicator::LED_NUM);
         let exe = Path::new(r"C:\CCaps\ccaps.exe");
         let cmd = background_command_line(exe, &codes(&["de"]));
         assert!(cmd.contains("-led num"), "got: {}", cmd);
         // Restore default
-        layout_indicator::set_active_leds(layout_indicator::LED_SCROLL);
+        layout_indicator::set_active_leds(0);
     }
 
     #[test]
     fn test_led_option_omitted_for_default() {
-        // Default (scroll only) should not produce -led in the command line
-        layout_indicator::set_active_leds(layout_indicator::LED_SCROLL);
+        // Default (no LEDs) should not produce -led in the command line
+        layout_indicator::set_active_leds(0);
         let exe = Path::new(r"C:\CCaps\ccaps.exe");
         let cmd = background_command_line(exe, &codes(&["de"]));
         assert!(!cmd.contains("-led"), "got: {}", cmd);
